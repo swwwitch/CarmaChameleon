@@ -1,0 +1,773 @@
+import AppKit
+import SwiftUI
+import UniformTypeIdentifiers
+import ServiceManagement
+
+func L(_ key: String) -> String { NSLocalizedString(key, comment:"") }
+
+@MainActor final class Model: ObservableObject {
+    @Published var files: [URL] = [] { didSet { matchFormatToFiles() } }
+    @Published var formatID = UserDefaults.standard.string(forKey:"format") ?? "docx" { didSet { if !switchingForFiles { UserDefaults.standard.set(formatID,forKey:"format") } } }
+    private var switchingForFiles = false
+    @Published var reader = "auto"
+    @Published var toc = false
+    @Published var numbers = false
+    @Published var standalone = true
+    @Published var wrap = "auto"
+    @Published var htmlFormatting = HTMLFormatting(rawValue:UserDefaults.standard.string(forKey:"htmlFormatting") ?? "standard") ?? .standard { didSet { UserDefaults.standard.set(htmlFormatting.rawValue,forKey:"htmlFormatting") } }
+    @Published var pdfEngine = ConversionRunner.preferredPDFEngine { didSet { UserDefaults.standard.set(pdfEngine,forKey:"pdfEngine") } }
+    @Published var keynoteSlideSize = KeynoteSlideSize(rawValue:UserDefaults.standard.string(forKey:"keynoteSlideSize") ?? "") ?? .matchPDF { didSet { UserDefaults.standard.set(keynoteSlideSize.rawValue,forKey:"keynoteSlideSize") } }
+    @Published var keynotePlacement = KeynotePlacement(rawValue:UserDefaults.standard.string(forKey:"keynotePlacement") ?? "") ?? .fit { didSet { UserDefaults.standard.set(keynotePlacement.rawValue,forKey:"keynotePlacement") } }
+    @Published var keynoteBox = KeynotePageBox(rawValue:UserDefaults.standard.string(forKey:"keynoteBox") ?? "") ?? .crop { didSet { UserDefaults.standard.set(keynoteBox.rawValue,forKey:"keynoteBox") } }
+    @Published var showAutomationHelp = false
+    @Published var keepStructure = UserDefaults.standard.bool(forKey:"plainKeepStructure") { didSet { UserDefaults.standard.set(keepStructure,forKey:"plainKeepStructure") } }
+    @Published var textOptions = MarkdownTextOptions.load() { didSet { textOptions.save() } }
+    @Published var pdfTextMode = UserDefaults.standard.string(forKey:"pdfTextMode") ?? "reading" { didSet { UserDefaults.standard.set(pdfTextMode,forKey:"pdfTextMode") } }
+    @Published var busy = false
+    @Published var status = ""
+    @Published var details = ""
+    @Published var completed = 0
+    @Published var results: [URL] = []
+    @Published var destinationMode = UserDefaults.standard.string(forKey:"destinationMode") ?? "source" { didSet { UserDefaults.standard.set(destinationMode,forKey:"destinationMode") } }
+    @Published var openAfterConversion = UserDefaults.standard.bool(forKey:"openAfterConversion") { didSet { UserDefaults.standard.set(openAfterConversion,forKey:"openAfterConversion") } }
+    @Published var revealAfterConversion = UserDefaults.standard.bool(forKey:"revealAfterConversion") { didSet { UserDefaults.standard.set(revealAfterConversion,forKey:"revealAfterConversion") } }
+    @Published var folder: URL? = UserDefaults.standard.string(forKey:"outputFolder").map { URL(fileURLWithPath:$0) } { didSet { UserDefaults.standard.set(folder?.path,forKey:"outputFolder") } }
+    var runner: ConversionRunner?
+    var format: OutputFormat { OutputFormat.all.first { $0.id == formatID } ?? OutputFormat.defaultFormat }
+    /// Called when the format list changes in Settings: a hidden format cannot stay selected.
+    func ensureVisibleFormat() {
+        let visible = FormatPreferences.shared.visible
+        if !visible.contains(where: { $0.id == formatID }), let first = visible.first { formatID = first.id }
+        matchFormatToFiles()
+    }
+    /// Formats the added files cannot become are not listed, so the selection moves to the first usable one.
+    /// The saved choice is kept and comes back once the files allow it again.
+    func matchFormatToFiles() {
+        let visible = FormatPreferences.shared.visible
+        func usable(_ id: String) -> Bool { visible.first { $0.id == id }.map { $0.unsupportedReason(for:files) == nil } ?? false }
+        let saved = UserDefaults.standard.string(forKey:"format") ?? formatID
+        let target = usable(saved) ? saved : usable(formatID) ? formatID : visible.first { usable($0.id) }?.id
+        guard let target, target != formatID else { return }
+        switchingForFiles = true; formatID = target; switchingForFiles = false
+    }
+    func add(_ urls: [URL]) {
+        guard !busy else { return }
+        // Any file is accepted while 「ファイル名のみ」 is listed; otherwise only the inputs some format reads.
+        let anyFile = FormatPreferences.shared.visible.contains { $0.id == "filename" }
+        var rejected = false
+        for url in urls {
+            let values = try? url.resourceValues(forKeys:[.isRegularFileKey,.isDirectoryKey])
+            guard url.isFileURL, values?.isRegularFile == true || (anyFile && values?.isDirectory == true), anyFile || OutputFormat.knownInputs.contains(url.pathExtension.lowercased()) else { rejected = true; continue }
+            let canonical = url.standardizedFileURL
+            if !files.contains(canonical) { files.append(canonical) }
+        }
+        status = rejected ? L("unsupported") : ""
+        results = []; details = ""
+    }
+    func chooseFiles() {
+        let p = NSOpenPanel(); p.allowsMultipleSelection = true
+        p.canChooseDirectories = FormatPreferences.shared.visible.contains { $0.id == "filename" }  // folders: 「ファイル名のみ」
+        if p.runModal() == .OK { add(p.urls) }
+    }
+    func chooseFolder() {
+        let p = NSOpenPanel(); p.canChooseDirectories = true; p.canChooseFiles = false; p.canCreateDirectories = true
+        p.prompt = L("selectFolder")
+        if p.runModal() == .OK { folder = p.url }
+    }
+    /// clearAfter (⌘-click on 変換): files that converted are removed from the input list when done.
+    func start(clearAfter: Bool = false) {
+#if APP_STORE
+        pdfEngine = "typst"
+#endif
+        guard !busy, !files.isEmpty else { return }
+        if let reason = format.unsupportedReason(for:files) { status = L(reason); return }
+        guard let engine = ConversionRunner.engine() else { status = L("engineMissing"); return }
+        // .ai / .psd → PDF never typesets, so only other inputs need a PDF engine.
+        if formatID == "pdf", files.contains(where: { !OutputFormat.imageOnlyInputs.union(["ai"]).contains($0.pathExtension.lowercased()) }), !ConversionRunner.pdfAvailable(pdfEngine) { status = L("pdfMissing"); return }
+        if formatID == "keynote" {
+            guard KeynoteBridge.isInstalled else { status = L("keynoteMissing"); return }
+            if files.contains(where: { !ConversionRunner.isPDF($0) }), !ConversionRunner.pdfAvailable(pdfEngine) { status = L("keynoteNeedsPDF"); return }
+        }
+        // 「元のファイルの名前を変更」 renames in place: the destination setting does not apply.
+        let renamesOriginals = formatID == "filename" && UserDefaults.standard.bool(forKey:"filenameRename")
+        if !renamesOriginals {
+            if destinationMode == "custom", folder == nil { chooseFolder() }
+            guard destinationMode == "source" || folder != nil else { return }
+        }
+#if APP_STORE
+        let destinations = destinationMode == "custom" && !renamesOriginals ? [folder].compactMap { $0 } : files.map { $0.deletingLastPathComponent() }
+        guard destinations.allSatisfy(StoreFolderAccess.isUserDocumentDestination) else { status = L("storeContainerDestination"); return }
+        do {
+            var required = files.map { $0.deletingLastPathComponent() }
+            if destinationMode == "custom", let folder { required.append(folder) }
+            guard try StoreFolderAccess.shared.authorize(required) else { return }
+        } catch { status = error.localizedDescription; return }
+#endif
+        let customFolder = destinationMode == "custom" && !renamesOriginals ? folder : nil
+        let shouldOpen = openAfterConversion; let shouldReveal = revealAfterConversion
+        let inputs = files
+        var opts = ConversionOptions(format:format,reader:reader,standalone:standalone,toc:toc,numbers:numbers,wrap:wrap,pdfEngine:pdfEngine,htmlFormatting:htmlFormatting)
+        // Keynote keeps the finished presentation open instead of reopening the saved file.
+        if formatID == "plain" && keepStructure { opts.markdownText = textOptions }
+        opts.pdfTextMode = pdfTextMode
+        let defaults = UserDefaults.standard
+        opts.aiMethod = defaults.string(forKey:"aiMethod") ?? "simple"
+        opts.aiPreset = defaults.string(forKey:"aiPDFPreset") ?? ""
+        if let path = defaults.string(forKey:"illustratorPath"), !path.isEmpty, FileManager.default.fileExists(atPath:path) { opts.illustratorApp = URL(fileURLWithPath:path) }
+        let renameOnly = formatID == "filename"
+        if !renameOnly, opts.aiMethod == "illustrator" || formatID == "svg", files.contains(where: { $0.pathExtension.lowercased() == "ai" }), opts.illustratorApp == nil, IllustratorBridge.defaultInstallation() == nil {
+            status = L("illustratorMissing"); return
+        }
+        opts.loadImageSettings()
+        if !renameOnly, opts.psdMethod == "photoshop", files.contains(where: { $0.pathExtension.lowercased() == "psd" }), opts.photoshopApp == nil, PhotoshopBridge.defaultInstallation() == nil {
+            status = L("photoshopMissing"); return
+        }
+        if !renameOnly, files.contains(where: { $0.pathExtension.lowercased() == "indd" }), opts.indesignApp == nil, InDesignBridge.defaultInstallation() == nil {
+            status = L("indesignMissing"); return
+        }
+        // 「1つのPDFにまとめる」: all raster images become the pages of one PDF.
+        let combine = formatID == "pdf" && defaults.bool(forKey:"pdfCombineImages") && files.count > 1 && files.allSatisfy { OutputFormat.rasterInputs.contains($0.pathExtension.lowercased()) }
+        opts.keynote = KeynoteOptions(slideSize:keynoteSlideSize, placement:keynotePlacement, box:keynoteBox, pageRange:nil, openAfter:shouldOpen)
+        let worker = ConversionRunner(); runner = worker; busy = true; completed = 0; results = []; details = ""; showAutomationHelp = false; status = L("working")
+        DispatchQueue.global(qos:.userInitiated).async {
+            var outputs: [URL] = []; var errors: [String] = []; var denied = false; var succeeded = 0; var done: [URL] = []; var renamed: [URL: URL] = [:]
+            if combine {
+                do { outputs.append(try worker.combineImagesToPDF(inputs, folder:customFolder ?? inputs[0].deletingLastPathComponent())); succeeded = inputs.count; done = inputs }
+                catch is CancellationError {}
+                catch { errors.append(error.localizedDescription) }
+            }
+            for (index,input) in inputs.enumerated() where !combine {
+                if worker.isCancelled { break }
+                do {
+                    let written = try worker.convertFiles(engine:engine,input:input,folder:customFolder ?? input.deletingLastPathComponent(),options:opts)
+                    outputs += written; succeeded += 1; done.append(input)
+                    if renamesOriginals, let first = written.first { renamed[input] = first.standardizedFileURL }
+                }
+                catch is CancellationError { break }
+                catch {
+                    errors.append(input.lastPathComponent + ": " + error.localizedDescription)
+                    if (error as? KeynoteError) == .automationDenied || IllustratorBridge.isAutomationDenied(error) { denied = true; break }  // Every remaining file would fail the same way.
+                }
+                DispatchQueue.main.async { self.completed = index + 1 }
+            }
+            let finalRenamed = renamed; let finalOutputs = outputs; let finalErrors = errors; let finalWarnings = worker.warnings; let finalDenied = denied; let finalSucceeded = succeeded; let finalDone = done
+            DispatchQueue.main.async {
+                self.busy = false; self.runner = nil
+                // Renamed originals stay in the list under their new names.
+                self.files = self.files.map { finalRenamed[$0] ?? $0 }
+                if clearAfter { self.files.removeAll { finalDone.contains($0) || finalRenamed.values.contains($0) } }
+                self.results = finalOutputs
+                self.details = (finalErrors + finalWarnings).joined(separator:"\n\n")
+                let key = worker.isCancelled ? "cancelled" : finalErrors.isEmpty ? "success" : finalOutputs.isEmpty ? "failed" : "partial"
+                self.status = L(key) + " · \(finalSucceeded)/\(inputs.count)" + (finalOutputs.count > finalSucceeded ? " · " + String(format:L("filesWritten"), finalOutputs.count) : "")
+                self.showAutomationHelp = finalDenied
+                if shouldOpen && !worker.isCancelled {
+                    for url in finalOutputs where url.pathExtension.lowercased() != "key" { NSWorkspace.shared.open(url) }
+                    if finalOutputs.contains(where: { $0.pathExtension.lowercased() == "key" }) { KeynoteBridge.activateKeynote() }
+                }
+                if shouldReveal && !worker.isCancelled && !finalOutputs.isEmpty { NSWorkspace.shared.activateFileViewerSelecting(finalOutputs) }
+            }
+        }
+    }
+    func cancel() { runner?.cancel(); status = L("cancelling") }
+    /// Re-reads the synced settings after SettingsSync applied another Mac's values (the didSets write back the same values).
+    func reloadSyncedSettings() {
+        formatID = UserDefaults.standard.string(forKey:"format") ?? "docx"
+        htmlFormatting = HTMLFormatting(rawValue:UserDefaults.standard.string(forKey:"htmlFormatting") ?? "standard") ?? .standard
+        keynoteSlideSize = KeynoteSlideSize(rawValue:UserDefaults.standard.string(forKey:"keynoteSlideSize") ?? "") ?? .matchPDF
+        keynotePlacement = KeynotePlacement(rawValue:UserDefaults.standard.string(forKey:"keynotePlacement") ?? "") ?? .fit
+        keynoteBox = KeynotePageBox(rawValue:UserDefaults.standard.string(forKey:"keynoteBox") ?? "") ?? .crop
+        keepStructure = UserDefaults.standard.bool(forKey:"plainKeepStructure")
+        textOptions = MarkdownTextOptions.load()
+        pdfTextMode = UserDefaults.standard.string(forKey:"pdfTextMode") ?? "reading"
+        openAfterConversion = UserDefaults.standard.bool(forKey:"openAfterConversion")
+        revealAfterConversion = UserDefaults.standard.bool(forKey:"revealAfterConversion")
+        FormatPreferences.shared.reload()
+        ensureVisibleFormat()
+    }
+}
+
+/// Which output formats the main window lists, and in what order (Settings › 変換形式).
+@MainActor final class FormatPreferences: ObservableObject {
+    static let shared = FormatPreferences()
+    @Published var order: [String] { didSet { UserDefaults.standard.set(order,forKey:"formatOrder") } }
+    @Published var hidden: Set<String> { didSet { UserDefaults.standard.set(Array(hidden).sorted(),forKey:"hiddenFormats") } }
+    private init() {
+        (order, hidden) = Self.load()
+    }
+    /// After SettingsSync applied another Mac's format list.
+    func reload() { (order, hidden) = Self.load() }
+    private static func load() -> ([String], Set<String>) {
+        let known = OutputFormat.all.map(\.id)
+        let saved = (UserDefaults.standard.stringArray(forKey:"formatOrder") ?? []).filter { known.contains($0) }
+        var list = saved
+        // 0.8: ラスター画像・SVG・CSV once move under PDF, even where an earlier version listed them at the end.
+        let defaults = UserDefaults.standard
+        if !defaults.bool(forKey:"formatOrderImagesUnderPDF") { list.removeAll { ["image","svg","csv"].contains($0) }; defaults.set(true,forKey:"formatOrderImagesUnderPDF") }
+        // A format not in the saved order goes right after the format before it in the default order.
+        for (index,id) in known.enumerated() where !list.contains(id) {
+            let anchor = known[..<index].last { list.contains($0) }
+            list.insert(id, at:anchor.flatMap { list.firstIndex(of:$0) }.map { $0 + 1 } ?? 0)
+        }
+        var hiddenList = Set(defaults.stringArray(forKey:"hiddenFormats") ?? Array(Self.defaultHidden))
+        // 0.10: OpenDocument and LaTeX start hidden, once also for settings saved by an earlier version.
+        if !defaults.bool(forKey:"formatsDefaultHidden") { hiddenList.formUnion(Self.defaultHidden); defaults.set(true,forKey:"formatsDefaultHidden") }
+        return (list, hiddenList.intersection(known))
+    }
+    static let defaultHidden: Set<String> = ["odt","latex"]
+    var ordered: [OutputFormat] { order.compactMap { id in OutputFormat.all.first { $0.id == id } } }
+    var visible: [OutputFormat] { ordered.filter { !hidden.contains($0.id) } }
+    func setVisible(_ id: String, _ on: Bool) {
+        if on { hidden.remove(id) } else if visible.count > 1 { hidden.insert(id) }
+    }
+    /// The formats of one category in their saved order (Settings lists them under the category headings).
+    func ordered(in category: String) -> [OutputFormat] { ordered.filter { $0.category == category } }
+    /// Moves within the category: the other categories keep their places in the order.
+    func move(in category: String, fromOffsets source: IndexSet, toOffset destination: Int) {
+        var ids = ordered(in:category).map(\.id)
+        ids.move(fromOffsets:source, toOffset:destination)
+        var next = ids.makeIterator()
+        order = order.map { id in OutputFormat.all.first { $0.id == id }?.category == category ? next.next() ?? id : id }
+    }
+    func move(_ id: String, by offset: Int) {
+        guard let format = OutputFormat.all.first(where: { $0.id == id }) else { return }
+        let ids = ordered(in:format.category).map(\.id)
+        guard let index = ids.firstIndex(of:id), ids.indices.contains(index + offset) else { return }
+        move(in:format.category, fromOffsets:[index], toOffset:offset > 0 ? index + offset + 1 : index + offset)
+    }
+    func reset() { order = OutputFormat.all.map(\.id); hidden = Self.defaultHidden }
+}
+
+/// Mustard accent. Dark Mode uses a lighter mustard so tinted controls keep contrast (3:1 or more) on the dark surface.
+let appTint = Color(nsColor: NSColor(name: nil) { appearance in
+    appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        ? NSColor(srgbRed: 0.78, green: 0.56, blue: 0.14, alpha: 1)
+        : NSColor(srgbRed: 0.55, green: 0.38, blue: 0.04, alpha: 1)
+})
+
+struct MainView: View {
+    @ObservedObject var model: Model
+    @ObservedObject var formats = FormatPreferences.shared
+    @ObservedObject var pdfManager = PDFEngineManager.shared
+    @State private var targeted = false
+    @AppStorage("filenameRename") var filenameRename = false
+    /// 「ファイル名のみ」 › 「元のファイルの名前を変更」: no destination, and the originals do change.
+    var renamesOriginals: Bool { model.formatID == "filename" && filenameRename }
+    var body: some View {
+        VStack(alignment:.leading,spacing:20) {
+            HStack(spacing:12) {
+                VStack(spacing: 4) {
+                    Image(nsImage:currentAppIcon()).resizable().frame(width:52,height:52).accessibilityHidden(true)
+                    AppVersionLabel()
+                }
+                VStack(alignment:.leading,spacing:4) { Text(L("heading")).font(.system(size:22,weight:.semibold)); Text(L("subtitle")).foregroundStyle(.secondary) }
+                Spacer()
+                Text("CARMA CHAMELEON").font(.system(size:10,weight:.semibold,design:.rounded)).tracking(2).foregroundStyle(.secondary)
+            }
+            HStack(alignment:.top,spacing:16) {
+                VStack(alignment:.leading,spacing:12) {
+                    heading("01", L("input"))
+                    VStack(spacing:12) {
+                        Image(systemName:"doc.badge.plus").font(.system(size:32,weight:.light)).foregroundColor(.secondary)
+                        Text(L("drop")).font(.headline)
+                        Text(L("inputHint")).font(.caption).foregroundColor(.secondary).multilineTextAlignment(.center)
+                        Button(L("chooseFiles")) { model.chooseFiles() }
+                    }.frame(maxWidth:.infinity).frame(height:155)
+                    .accessibilityElement(children:.contain).accessibilityLabel(L("drop") + " " + L("inputHint"))
+                    .background(Color(nsColor:.textBackgroundColor)).cornerRadius(10)
+                    .overlay(RoundedRectangle(cornerRadius:10).strokeBorder(targeted ? Color.accentColor : Color.gray.opacity(0.35),style:StrokeStyle(lineWidth:1.5,dash:[6,4])))
+                    .onDrop(of:[UTType.fileURL.identifier],isTargeted:$targeted) { providers in
+                        guard !model.busy else { return false }
+                        for provider in providers { _ = provider.loadObject(ofClass:URL.self) { url,_ in if let url { DispatchQueue.main.async { model.add([url]) } } } }
+                        return true
+                    }
+                    ScrollView {
+                        VStack(spacing:8) {
+                            ForEach(model.files,id:\.self) { url in
+                                HStack(spacing:8) {
+                                    Image(nsImage:NSWorkspace.shared.icon(forFile:url.path)).resizable().frame(width:24,height:24)
+                                    Text(url.lastPathComponent).lineLimit(2).frame(maxWidth:.infinity,alignment:.leading).help(url.path)
+                                    Button { model.files.removeAll { $0 == url } } label: { Image(systemName:"xmark.circle.fill").foregroundColor(.secondary) }.buttonStyle(.plain).accessibilityLabel(L("remove"))
+                                }.padding(9).background(Color(nsColor:.textBackgroundColor)).cornerRadius(7)
+                            }
+                        }
+                    }
+                    HStack { Text("\(model.files.count) " + L("files")).font(.caption).foregroundColor(.secondary); Spacer(); Button(L("clear")) { model.files = [] }.disabled(model.files.isEmpty) }
+                }.frame(maxWidth:.infinity).disabled(model.busy)
+                Divider()
+                VStack(alignment:.leading,spacing:12) {
+                    heading("02",L("format"))
+                    ScrollView {
+                        // Formats the added files cannot become are hidden. Only when none fits are all listed, dimmed, with the reason as the tooltip.
+                        let usable = formats.visible.filter { $0.unsupportedReason(for:model.files) == nil }
+                        let listed = usable.isEmpty ? formats.visible : usable
+                        VStack(alignment:.leading,spacing:12) {
+                            ForEach(OutputFormat.categories,id:\.self) { category in
+                                let items = listed.filter { $0.category == category }
+                                if !items.isEmpty {
+                                    VStack(alignment:.leading,spacing:6) {
+                                        if !category.isEmpty { Text(L(category)).font(.caption).fontWeight(.semibold).foregroundStyle(.secondary).padding(.leading,4) }
+                                        ForEach(items) { formatRow($0) }
+                                    }
+                                }
+                            }
+                            if listed.count < formats.visible.count {
+                                Text(String(format:L("formatsHiddenForInput"),formats.visible.count - listed.count)).font(.caption).foregroundColor(.secondary).fixedSize(horizontal:false,vertical:true)
+                            }
+                        }
+                    }
+                }.frame(width:195).disabled(model.busy)
+                Divider()
+                VStack(alignment:.leading,spacing:14) {
+                    heading("03",L("options"))
+                    ScrollView {
+                        VStack(alignment:.leading,spacing:16) {
+                            if let reason = model.format.unsupportedReason(for:model.files) {
+                                Label(L(reason),systemImage:"exclamationmark.triangle").font(.caption).foregroundColor(.orange).fixedSize(horizontal:false,vertical:true)
+                            }
+                            if model.formatID == "csv" {
+                                CSVOptionsView()
+                                Divider()
+                            } else if model.formatID == "xlsx" {
+                                XLSXOptionsView()
+                                Divider()
+                            } else if model.formatID == "utf16" {
+                                // Re-encoding only: pandoc's reader and document options do not apply.
+                                UTF16OptionsView()
+                                Divider()
+                            } else if model.formatID == "filename" {
+                                // Renaming only: the contents are copied as they are.
+                                FileNameOptionsView()
+                                Divider()
+                            } else if model.format.isImage {
+                                // Image outputs: pandoc's reader and document options do not apply.
+                                if model.formatID == "image" { RasterOptionsView() } else { SVGOptionsView() }
+                                Divider()
+                                FileNamingView(svg:model.formatID == "svg")
+                                Text(L(model.formatID == "svg" ? "svgHint" : "imageHint")).font(.caption).foregroundColor(.secondary).fixedSize(horizontal:false,vertical:true)
+                                Divider()
+                            } else if model.files.isEmpty || !model.files.allSatisfy({ OutputFormat.imageOnlyInputs.union(["ai"]).contains($0.pathExtension.lowercased()) }) {
+                            // pandoc's reader and document options; not shown when only .ai / .psd / .indd / images are added.
+                            Text(L("readAs")).fontWeight(.medium)
+                            Picker("",selection:$model.reader) {
+                                Text(L("auto")).tag("auto")
+                                ForEach(["markdown","gfm","html","docx","odt","rtf","epub","latex","rst","org","ipynb","csv","tsv","xlsx","idml","pdf"],id:\.self) { Text($0).tag($0) }
+                            }.labelsHidden().accessibilityLabel(L("readAs"))
+                            Divider()
+                            Toggle(L("standalone"),isOn:$model.standalone)
+                            Toggle(L("toc"),isOn:$model.toc).disabled(!model.format.supportsTOC)
+                            Toggle(L("numbers"),isOn:$model.numbers).disabled(!model.format.supportsNumbers)
+                            }
+                            if model.formatID == "plain", model.files.contains(where:ConversionRunner.isPDF) || model.reader == "pdf" {
+                                // PDF input is written by pdftotext directly; 「構造を保持」 and wrapping do not apply to it.
+                                Picker(L("pdfTextMode"),selection:$model.pdfTextMode) {
+                                    Text(L("pdfTextReading")).tag("reading"); Text(L("pdfTextLayout")).tag("layout"); Text(L("pdfTextRaw")).tag("raw")
+                                }.pickerStyle(.radioGroup)
+                                Text(L("pdfTextModeHint")).font(.caption).foregroundColor(.secondary).fixedSize(horizontal:false,vertical:true)
+                            }
+                            if model.formatID == "plain" {
+                                Toggle(L("keepStructure"),isOn:$model.keepStructure)
+                                Text(L("keepStructureHint")).font(.caption).foregroundColor(.secondary).fixedSize(horizontal:false,vertical:true)
+                                if model.keepStructure { StructureOptionsView(options:$model.textOptions) }
+                            }
+                            if ["gfm","plain","latex"].contains(model.formatID) && !(model.formatID == "plain" && model.keepStructure) {
+                                Picker(L("wrap"),selection:$model.wrap) { Text(L("auto")).tag("auto"); Text(L("preserve")).tag("preserve"); Text(L("none")).tag("none") }
+                            }
+                            if model.formatID == "html5" {
+                                Picker(L("htmlFormatting"),selection:$model.htmlFormatting) {
+                                    Text(L("htmlStandard")).tag(HTMLFormatting.standard)
+                                    Text("minify").tag(HTMLFormatting.minify)
+                                    Text("beautify").tag(HTMLFormatting.beautify)
+                                }.pickerStyle(.radioGroup)
+                                Text(L("htmlFormattingHint")).font(.caption).foregroundColor(.secondary).fixedSize(horizontal:false,vertical:true)
+                            }
+                            if model.formatID != "filename" {
+                            if model.files.contains(where: { $0.pathExtension.lowercased() == "ai" }) && model.formatID != "svg" { AIOptionsView() }
+                            if model.files.contains(where: { $0.pathExtension.lowercased() == "psd" }) { PSDOptionsView() }
+                            if model.files.contains(where: { $0.pathExtension.lowercased() == "indd" }) { InDesignOptionsView(showPreset:model.formatID == "pdf") }
+                            }
+                            if model.formatID == "pdf", model.files.filter({ OutputFormat.rasterInputs.contains($0.pathExtension.lowercased()) }).count > 1 { CombineImagesView() }
+                            if model.formatID == "keynote" {
+                                Picker(L("slideSize"),selection:$model.keynoteSlideSize) { ForEach(KeynoteSlideSize.allCases) { Text($0.label).tag($0) } }
+                                Picker(L("placement"),selection:$model.keynotePlacement) { Text(L("fit")).tag(KeynotePlacement.fit); Text(L("fill")).tag(KeynotePlacement.fill) }.pickerStyle(.radioGroup)
+                                if model.keynotePlacement == .fill { Text(L("fillHint")).font(.caption).foregroundColor(.secondary).fixedSize(horizontal:false,vertical:true) }
+                                Picker(L("box"),selection:$model.keynoteBox) { ForEach(KeynotePageBox.allCases) { Text($0.label).tag($0) } }
+                                Text(L("keynoteHint")).font(.caption).foregroundColor(.secondary).fixedSize(horizontal:false,vertical:true)
+                            }
+                            if (model.formatID == "pdf" && model.files.contains(where: { !OutputFormat.imageOnlyInputs.union(["ai"]).contains($0.pathExtension.lowercased()) })) || (model.formatID == "keynote" && model.files.contains(where: { !ConversionRunner.isPDF($0) })) {
+                                Picker(L("pdfEngine"),selection:$model.pdfEngine) { Text("Typst").tag("typst");
+#if !APP_STORE
+ Text("XeLaTeX").tag("xelatex"); Text("LuaLaTeX").tag("lualatex")
+#endif
+ }
+                                Label(L(ConversionRunner.pdfAvailable(model.pdfEngine) ? "pdfReady" : "pdfMissing"),systemImage:"info.circle").font(.caption).foregroundColor(.secondary)
+                                Button(L("pdfSetup")) { (NSApp.delegate as? Delegate)?.showSettings() }
+                            }
+                            Divider()
+                            Text(L("output")).fontWeight(.medium)
+                            if renamesOriginals {
+                                Text(L("filenameRenameInPlace")).font(.caption).foregroundColor(.secondary).fixedSize(horizontal:false,vertical:true)
+                            } else {
+                            Picker(L("output"),selection:$model.destinationMode) {
+                                Text(L("sameFolder")).tag("source")
+                                Text(L("specifiedFolder")).tag("custom")
+                            }.pickerStyle(.radioGroup).labelsHidden()
+                            }
+                            if model.destinationMode == "custom" && !renamesOriginals {
+                                Text(model.folder?.path ?? L("chooseOnConvert")).font(.caption).foregroundColor(.secondary).textSelection(.enabled).fixedSize(horizontal:false,vertical:true)
+                                Button(L("selectFolder")) { model.chooseFolder() }
+                            }
+                            Toggle(L("openAfterConversion"),isOn:$model.openAfterConversion)
+                            Toggle(L("revealAfterConversion"),isOn:$model.revealAfterConversion)
+                            if model.formatID != "filename", model.files.contains(where: { $0.pathExtension.lowercased() == "idml" }) || model.reader == "idml" { Text(L("idmlLimit")).font(.caption).foregroundColor(.secondary).fixedSize(horizontal:false,vertical:true) }
+                            if !["keynote","filename"].contains(model.formatID), !model.format.isImage, model.files.contains(where: { $0.pathExtension.lowercased() == "pdf" }) || model.reader == "pdf" {
+                                Text(L("pdfInputHint")).font(.caption).foregroundColor(.secondary).fixedSize(horizontal:false,vertical:true)
+                                if PDFImporter.pdftotext() == nil { Label(L("pdftotextMissing"),systemImage:"info.circle").font(.caption).foregroundColor(.secondary).fixedSize(horizontal:false,vertical:true).textSelection(.enabled) }
+                            }
+                            if model.formatID == "idml" { Text(L("idmlOutputHint")).font(.caption).foregroundColor(.secondary).fixedSize(horizontal:false,vertical:true) }
+                            Text(L(renamesOriginals ? "filenameRenameWarning" : "preserveOriginal")).font(.caption).foregroundColor(.secondary).fixedSize(horizontal:false,vertical:true)
+                        }.padding(14).frame(maxWidth:.infinity,alignment:.leading)
+                    }.background(Color(nsColor:.textBackgroundColor)).cornerRadius(10)
+                    .overlay(RoundedRectangle(cornerRadius:10).strokeBorder(Color.gray.opacity(0.25)))
+                }.frame(width:260).disabled(model.busy)
+            }
+            Divider()
+            if !model.details.isEmpty { ScrollView { Text(model.details).font(.caption).textSelection(.enabled).frame(maxWidth:.infinity,alignment:.leading) }.frame(height:64) }
+            HStack(spacing:12) {
+                if model.busy { ProgressView().controlSize(.small); Text("\(model.completed)/\(model.files.count)").monospacedDigit() }
+                Text(model.status.isEmpty ? L("ready") : model.status).font(.callout).lineLimit(2).textSelection(.enabled)
+                Spacer()
+                if model.showAutomationHelp { Button(L("permOpen")) { KeynoteBridge.openAutomationSettings() } }
+                if model.busy { Button(L("cancel")) { model.cancel() }.keyboardShortcut(.cancelAction) }
+                // ⌘-click also clears the converted files from the input list; ⌘↩ (keyboard) does not.
+                Button(L("convert")) { let event = NSApp.currentEvent; model.start(clearAfter:event?.type == .leftMouseUp && event?.modifierFlags.contains(.command) == true) }.help(L("convertHelp")).keyboardShortcut(.return,modifiers:.command).buttonStyle(.borderedProminent).controlSize(.large).disabled(model.files.isEmpty || model.busy)
+            }
+        }.onReceive(NotificationCenter.default.publisher(for:NSApplication.didBecomeActiveNotification)) { _ in
+            model.pdfEngine = ConversionRunner.preferredPDFEngine
+        }.onReceive(pdfManager.$version) { _ in
+            model.pdfEngine = ConversionRunner.preferredPDFEngine
+        }.onReceive(FormatPreferences.shared.$hidden) { _ in DispatchQueue.main.async { model.ensureVisibleFormat() } }
+        .padding(24).frame(minWidth:990,minHeight:670).background(Color(nsColor:AppSurface.color)).tint(appTint)
+    }
+    func formatRow(_ format: OutputFormat) -> some View {
+        let reason = format.unsupportedReason(for:model.files)
+        let selected = model.formatID == format.id
+        return Button { model.formatID = format.id } label: {
+            HStack { VStack(alignment:.leading,spacing:2) { Text(format.name).fontWeight(.medium); Text(format.extLabel).font(.caption).foregroundStyle(.secondary) }; Spacer()
+                Image(systemName:selected && reason != nil ? "exclamationmark.triangle.fill" : selected ? "checkmark.circle.fill" : "circle").foregroundColor(selected && reason != nil ? .orange : selected ? .accentColor : .gray.opacity(0.4)) }
+            .padding(.horizontal,12).padding(.vertical,8).background(selected ? Color.accentColor.opacity(0.12) : Color(nsColor:.textBackgroundColor)).cornerRadius(7)
+            .opacity(reason == nil || selected ? 1 : 0.4)
+        }.buttonStyle(.plain).disabled(reason != nil && !selected).help(reason.map(L) ?? "")
+        .accessibilityLabel(format.name).accessibilityValue(selected ? L("selected") : reason.map(L) ?? "")
+    }
+    func heading(_ number: String,_ title: String) -> some View {
+        HStack(spacing:8) { Text(number).font(.system(size:11,weight:.semibold,design:.rounded)).foregroundColor(.secondary); Text(title).font(.system(size:14,weight:.semibold)) }
+    }
+}
+
+/// Options of 「構造を保持」 (same choices as cssnite.jp/tool/markdown2text.html).
+struct StructureOptionsView: View {
+    @Binding var options: MarkdownTextOptions
+    var body: some View {
+        VStack(alignment:.leading,spacing:10) {
+            Picker(L("mtLinks"),selection:$options.linkMode) {
+                Text(L("mtLinkText")).tag(MarkdownTextOptions.LinkMode.text)
+                Text(L("mtLinkAngle")).tag(MarkdownTextOptions.LinkMode.angle)
+                Text(L("mtLinkParen")).tag(MarkdownTextOptions.LinkMode.paren)
+            }
+            Toggle(L("mtLinkBelow"),isOn:$options.linkBelow).disabled(options.linkMode == .text)
+            HStack { Text(L("mtListMarker")); TextField("・",text:$options.listMarker).frame(width:44) }
+            Picker(L("mtNumbers"),selection:$options.numberMode) {
+                Text(L("mtNumKeep")).tag(MarkdownTextOptions.NumberMode.keep)
+                Text(L("mtNumRenumber")).tag(MarkdownTextOptions.NumberMode.renumber)
+                Text(L("mtNumMarker")).tag(MarkdownTextOptions.NumberMode.marker)
+            }
+            Toggle(L("mtZenkakuIndent"),isOn:$options.zenkakuIndent)
+            HStack(spacing:6) {
+                Text(L("mtHeadings"))
+                ForEach(0..<4,id:\.self) { level in
+                    TextField("H\(level+1)",text:Binding(get:{ options.headingPrefixes[level] },set:{ options.headingPrefixes[level] = $0 })).frame(width:34).help("H\(level+1)")
+                }
+            }
+            Picker(L("mtBold"),selection:$options.boldMode) {
+                Text(L("mtBoldNone")).tag(MarkdownTextOptions.BoldMode.none)
+                Text(L("mtBoldBracket")).tag(MarkdownTextOptions.BoldMode.bracket)
+            }
+            Picker(L("mtTables"),selection:$options.tableMode) {
+                Text(L("mtTableTab")).tag(MarkdownTextOptions.TableMode.tab)
+                Text(L("mtTableAscii")).tag(MarkdownTextOptions.TableMode.ascii)
+            }
+            Picker(L("mtImages"),selection:$options.imageMode) {
+                Text(L("mtImageText")).tag(MarkdownTextOptions.ImageMode.text)
+                Text(L("mtImageIgnore")).tag(MarkdownTextOptions.ImageMode.ignore)
+            }
+            Picker(L("mtBlockGap"),selection:$options.blockGap) { ForEach(0...2,id:\.self) { Text(L("mtGap\($0)")).tag($0) } }
+            Toggle(L("mtCollapseBlank"),isOn:$options.collapseBlank)
+            Toggle(L("mtTrimLeading"),isOn:$options.trimLeading)
+            Toggle(L("mtStripHTML"),isOn:$options.stripHTML)
+        }.padding(.leading,4)
+    }
+}
+
+extension MarkdownTextOptions {
+    private static let key = "plainStructureOptions"
+    static func load() -> MarkdownTextOptions {
+        var o = MarkdownTextOptions()
+        guard let d = UserDefaults.standard.dictionary(forKey:key) else { return o }
+        if let v = d["linkMode"] as? String, let m = LinkMode(rawValue:v) { o.linkMode = m }
+        if let v = d["numberMode"] as? String, let m = NumberMode(rawValue:v) { o.numberMode = m }
+        if let v = d["boldMode"] as? String, let m = BoldMode(rawValue:v) { o.boldMode = m }
+        if let v = d["tableMode"] as? String, let m = TableMode(rawValue:v) { o.tableMode = m }
+        if let v = d["imageMode"] as? String, let m = ImageMode(rawValue:v) { o.imageMode = m }
+        if let v = d["listMarker"] as? String { o.listMarker = v }
+        if let v = d["blockGap"] as? Int { o.blockGap = v }
+        for (name, path) in [("linkBelow", \MarkdownTextOptions.linkBelow), ("zenkakuIndent", \.zenkakuIndent), ("collapseBlank", \.collapseBlank), ("trimLeading", \.trimLeading), ("trimBlank", \.trimBlank), ("stripHTML", \.stripHTML)] {
+            if let v = d[name] as? Bool { o[keyPath:path] = v }
+        }
+        if let v = d["headingPrefixes"] as? [String], v.count == 6 { o.headingPrefixes = v }
+        return o
+    }
+    func save() {
+        UserDefaults.standard.set(["linkMode":linkMode.rawValue,"numberMode":numberMode.rawValue,"boldMode":boldMode.rawValue,"tableMode":tableMode.rawValue,"imageMode":imageMode.rawValue,"listMarker":listMarker,"blockGap":blockGap,"linkBelow":linkBelow,"zenkakuIndent":zenkakuIndent,"collapseBlank":collapseBlank,"trimLeading":trimLeading,"trimBlank":trimBlank,"stripHTML":stripHTML,"headingPrefixes":headingPrefixes],forKey:Self.key)
+    }
+}
+
+struct SettingsView: View {
+    @AppStorage("resident") var resident = true
+    var body: some View {
+        SettingsTabs(sections:[
+            (SettingsUI.launchTitle, AnyView(VStack(spacing:16) {
+                SettingsSection(SettingsUI.launchTitle) {
+                    LaunchPresenceSection(title:SettingsUI.launchTitle, loginControl:LoginAtLaunchView(), residentTitle:L("resident"), residentDetail:L("residentDetail"), resident:$resident,
+                                          presenceExtra:MenuBarPresenceView(), shortcutTitle:L("launchShortcut"), shortcutButton:L("openShortcuts"), shortcutDetail:L("shortcutDetail")) {
+                        NSWorkspace.shared.open(URL(fileURLWithPath:"/System/Applications/Shortcuts.app"))
+                    }
+                }
+                SettingsSection(L("permission")) { KeynotePermissionView() }
+            })),
+            (L("format"), AnyView(SettingsSection(L("formatsTitle")) { FormatSettingsView() })),
+            ("Illustrator", AnyView(SettingsSection(L("aiTitle")) { IllustratorSettingsView() })),
+            ("Photoshop", AnyView(SettingsSection(L("psdTitle")) { PhotoshopSettingsView() })),
+            ("InDesign", AnyView(SettingsSection(L("inddTitle")) { InDesignSettingsView() })),
+            (L("enginesTab"), AnyView(VStack(spacing:16) {
+                SettingsSection(L("engine")) { EngineSettingsView() }
+                SettingsSection(L("pdfEngineGroup")) { PDFEngineSettingsView() }
+            })),
+            (SettingsSync.shared.tabTitle, AnyView(SettingsSharingView())),
+            (AboutSection.title, AnyView(AboutView())),
+        ]).frame(minWidth:620,maxWidth:.infinity,minHeight:640,maxHeight:.infinity)
+    }
+}
+
+/// .ai conversion method and PDF preset (shared by the main window and Settings › Illustrator).
+struct AIOptionsView: View {
+    @AppStorage("aiMethod") var method = "simple"
+    @AppStorage("aiPDFPreset") var preset = ""
+    @AppStorage("aiPDFPresetList") var presetList = ""
+    var compact = true
+    var body: some View {
+        VStack(alignment:.leading,spacing:8) {
+            if compact { Text(L("aiTitle")).fontWeight(.medium) }   // Settings already shows it as the section title
+            Picker(L("aiMethod"),selection:$method) {
+                Text(L("aiSimple")).tag("simple")
+                Text(L("aiIllustrator")).tag("illustrator")
+            }.pickerStyle(.radioGroup).labelsHidden()
+            if method == "illustrator" {
+                Picker(L("aiPreset"),selection:$preset) {
+                    Text(L("aiPresetDefault")).tag("")
+                    ForEach(presetList.components(separatedBy:"\n").filter { !$0.isEmpty },id:\.self) { Text($0).tag($0) }
+                    if !preset.isEmpty && !presetList.components(separatedBy:"\n").contains(preset) { Text(preset).tag(preset) }
+                }
+            }
+            Text(L(method == "illustrator" ? "aiIllustratorHint" : "aiSimpleHint")).font(.caption).foregroundColor(.secondary).fixedSize(horizontal:false,vertical:true)
+        }
+    }
+}
+
+/// Settings › Illustrator: method, which Illustrator, PDF preset (loaded from Illustrator).
+struct IllustratorSettingsView: View {
+    @AppStorage("illustratorPath") var path = ""
+    @AppStorage("aiPDFPresetList") var presetList = ""
+    @State private var loading = false
+    @State private var message = ""
+    @State private var denied = false
+    private let installations = IllustratorBridge.installations()
+    var body: some View {
+        VStack(alignment:.leading,spacing:12) {
+            AIOptionsView(compact:false)
+            Divider()
+            if installations.isEmpty {
+                Label(L("illustratorMissing"),systemImage:"exclamationmark.triangle").foregroundColor(.secondary)
+            } else {
+                Picker(L("aiApp"),selection:$path) {
+                    Text(L("aiAppNewest") + " (" + (installations.first?.name ?? "") + ")").tag("")
+                    ForEach(installations) { Text($0.name + "  " + $0.version).tag($0.url.path) }
+                }
+                HStack {
+                    Button(L("aiLoadPresets")) { loadPresets() }.disabled(loading)
+                    if loading { ProgressView().controlSize(.small) }
+                    if denied { Button(L("permOpen")) { KeynoteBridge.openAutomationSettings() } }
+                }
+                Text(message.isEmpty ? L("aiLoadPresetsHint") : message).font(.caption).foregroundColor(.secondary).fixedSize(horizontal:false,vertical:true)
+            }
+        }
+    }
+    private func loadPresets() {
+        let app = path.isEmpty ? installations.first?.url : URL(fileURLWithPath:path)
+        guard let app else { return }
+        loading = true; message = L("aiLoadingPresets")
+        DispatchQueue.global(qos:.userInitiated).async {
+            let result = Result { try IllustratorBridge.presets(in:app) }
+            DispatchQueue.main.async {
+                loading = false
+                denied = false
+                switch result {
+                case .success(let names): presetList = names.joined(separator:"\n"); message = String(format:L("aiPresetsLoaded"), names.count)
+                case .failure(let error): message = error.localizedDescription; denied = IllustratorBridge.isAutomationDenied(error)
+                }
+            }
+        }
+    }
+}
+
+/// Settings › 変換形式: show/hide each output format and change the order (drag or ↑↓).
+struct FormatSettingsView: View {
+    @ObservedObject var formats = FormatPreferences.shared
+    var body: some View {
+        VStack(alignment:.leading,spacing:10) {
+            Text(L("formatsHint")).font(.caption).foregroundColor(.secondary).fixedSize(horizontal:false,vertical:true)
+            List {
+                ForEach(OutputFormat.categories,id:\.self) { category in
+                let items = formats.ordered(in:category)
+                Section(header:Group { if !category.isEmpty { Text(L(category)) } }) {
+                ForEach(items) { format in
+                    HStack(spacing:10) {
+                        Toggle(isOn:Binding(get:{ !formats.hidden.contains(format.id) },set:{ formats.setVisible(format.id,$0) })) {
+                            HStack(spacing:6) { Text(format.name); Text(format.extLabel).font(.caption).foregroundColor(.secondary) }
+                        }
+                        .disabled(!formats.hidden.contains(format.id) && formats.visible.count == 1)
+                        Spacer()
+                        Button { formats.move(format.id,by:-1) } label: { Image(systemName:"chevron.up") }.buttonStyle(.borderless).disabled(items.first?.id == format.id).accessibilityLabel(L("moveUp") + " " + format.name)
+                        Button { formats.move(format.id,by:1) } label: { Image(systemName:"chevron.down") }.buttonStyle(.borderless).disabled(items.last?.id == format.id).accessibilityLabel(L("moveDown") + " " + format.name)
+                    }.padding(.vertical,2)
+                }
+                .onMove { source, destination in formats.move(in:category, fromOffsets:source, toOffset:destination) }
+                }
+                }
+            }
+            .frame(height:400)
+            HStack { Spacer(); Button(L("resetFormats")) { formats.reset() } }
+        }
+    }
+}
+
+@MainActor final class Delegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+    let model = Model()
+    var window: NSWindow!
+    var settings: NSWindow?
+    var helpWindow: NSWindow?
+    var statusItem: NSStatusItem?
+    var isDuplicate = false
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        UserDefaults.standard.register(defaults:["resident":true])
+        if let id = Bundle.main.bundleIdentifier, let other = NSRunningApplication.runningApplications(withBundleIdentifier:id).first(where: { $0.processIdentifier != ProcessInfo.processInfo.processIdentifier }) {
+            isDuplicate = true
+            other.activate(options:[.activateAllWindows,.activateIgnoringOtherApps])
+            let urls = CommandLine.arguments.dropFirst().filter { !$0.hasPrefix("-") }.map { URL(fileURLWithPath:$0) }.filter { FileManager.default.fileExists(atPath:$0.path) }
+            if !urls.isEmpty, let app = other.bundleURL { NSWorkspace.shared.open(urls,withApplicationAt:app,configuration:NSWorkspace.OpenConfiguration()) }
+            DispatchQueue.main.asyncAfter(deadline:.now()+0.5) { NSApp.terminate(nil) }
+        }
+    }
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        guard !isDuplicate else { return }
+        SettingsSync.shared.onImport = { [weak self] in Task { @MainActor in self?.model.reloadSyncedSettings() } }
+        // Paths, presets read from the local Adobe apps, the PDF engine and the output folder stay per Mac.
+        SettingsSync.shared.start(.init(
+            keys: ["format", "htmlFormatting", "keynoteSlideSize", "keynotePlacement", "keynoteBox", "plainKeepStructure", "plainStructureOptions",
+                   "pdfTextMode", "openAfterConversion", "revealAfterConversion", "formatOrder", "hiddenFormats", "aiMethod", "psdMethod",
+                   "csvDelimiter", "pdfCombineImages", "nameFile", "nameNumber", "nameLabel", "nameDelimiter", "namePad", "nameSingle", "nameGroupFolder"],
+            prefixes: ["raster", "svg", "utf16", "filename", "xlsx"],
+            note: L("syncNote"), perMac: L("syncPerMac")))
+        buildMenus()
+        window = NSWindow(contentRect:NSRect(x:0,y:0,width:1080,height:720),styleMask:[.titled,.closable,.miniaturizable,.resizable],backing:.buffered,defer:false)
+        window.title = "CarmaChameleon"; window.titleVisibility = .hidden; window.contentView = NSHostingView(rootView:MainView(model:model)); window.delegate = self; window.isReleasedWhenClosed = false
+        if UserDefaults.standard.string(forKey:"NSWindow Frame MainWindow") == nil { window.center() }  // First launch: no saved frame yet.
+        window.setFrameAutosaveName("MainWindow"); window.minSize = NSSize(width:1030,height:710)
+        if !NSScreen.screens.contains(where: { $0.visibleFrame.intersects(window.frame) }) { window.center() }
+        statusItem = NSStatusBar.system.statusItem(withLength:NSStatusItem.squareLength)
+        statusItem?.button?.image = NSImage(systemSymbolName:"doc.on.doc",accessibilityDescription:"CarmaChameleon")
+        // Status menu (BASELINE「メニューの共通構成」): help lives in a submenu; Quit is last.
+        let menu = NSMenu(); add(menu,L("openMainWindow"),#selector(show),""); add(menu,L("settings"),#selector(showSettings),"")
+        let helpSub = NSMenu(title:L("helpMenu")); add(helpSub,L("help"),#selector(showHelp),""); HelpLinks.addNoteItem(to:helpSub)
+        menu.setSubmenu(helpSub,for:menu.addItem(withTitle:L("helpMenu"),action:nil,keyEquivalent:""))
+        menu.addItem(.separator()); add(menu,L("quit"),#selector(quit),""); statusItem?.menu = menu
+        // Shared menu-bar presence keeps this icon and menu; it adds 「メニューバー設定…」 to the app menu and the visibility setting.
+        MenuBarPresence.shared.install(name:"CarmaChameleon",symbol:"doc.on.doc",existing:statusItem,show:{ [weak self] in self?.show() },settings:{ [weak self] in self?.showSettings() },help:{ [weak self] in self?.showHelp() })
+        let login = LaunchPolicy.isLoginLaunch(NSAppleEventManager.shared().currentAppleEvent)
+        if !model.files.isEmpty || (!login && !StartupWindow.hidden) { show() }
+    }
+    @objc func show() { guard let window else { return }; NSApp.activate(ignoringOtherApps:true); if window.isMiniaturized { window.deminiaturize(nil) }; window.makeKeyAndOrderFront(nil) }
+    func applicationShouldHandleReopen(_ sender:NSApplication,hasVisibleWindows:Bool) -> Bool { show(); return true }
+    func application(_ sender:NSApplication,open urls:[URL]) {
+        if isDuplicate, let id = Bundle.main.bundleIdentifier, let other = NSRunningApplication.runningApplications(withBundleIdentifier:id).first(where: { $0.processIdentifier != ProcessInfo.processInfo.processIdentifier }), let app = other.bundleURL { NSWorkspace.shared.open(urls,withApplicationAt:app,configuration:NSWorkspace.OpenConfiguration()); return }
+        model.add(urls); show()
+    }
+    func windowShouldClose(_ sender:NSWindow) -> Bool {
+        if sender === window && !UserDefaults.standard.bool(forKey:"resident") { NSApp.terminate(nil); return false }
+        return true
+    }
+    func applicationShouldTerminate(_ sender:NSApplication) -> NSApplication.TerminateReply {
+        if EngineManager.shared.busy || PDFEngineManager.shared.busy { let a = NSAlert(); a.messageText = L("installing"); a.informativeText = L("waitInstall"); a.runModal(); return .terminateCancel }
+        if model.busy {
+            let a = NSAlert(); a.messageText = L("working"); a.informativeText = L("quitBusy"); a.addButton(withTitle:L("ok")); a.runModal(); show(); return .terminateCancel
+        }
+        return .terminateNow
+    }
+    func applicationWillTerminate(_ notification: Notification) { KeynoteBridge.removeRuntimeScript() }
+    @objc func quit() { NSApp.terminate(nil) }
+    @objc func choose() { show(); model.chooseFiles() }
+    @objc func showSettings() {
+        if settings == nil { settings = NSWindow(contentRect:NSRect(x:0,y:0,width:620,height:640),styleMask:[.titled,.closable,.resizable],backing:.buffered,defer:false); settings!.title = L("settingsWindow")
+            // Resizable from the designed size upward; the hosting view reports only its minimum.
+            let hosting = NSHostingView(rootView:SettingsView()); hosting.sizingOptions = [.minSize]
+            settings!.contentView = hosting; settings!.contentMinSize = NSSize(width:620,height:640); settings!.isReleasedWhenClosed = false; settings!.center() }
+        settings!.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps:true)
+    }
+    @objc func showHelp() {
+        if helpWindow == nil {
+            let text = Bundle.main.url(forResource:"Help",withExtension:"txt").flatMap { try? String(contentsOf:$0,encoding:.utf8) } ?? L("help")
+            helpWindow = HelpDocument.makeWindow(windowTitle:L("help"), text:text, heading:"CarmaChameleon")
+        }
+        helpWindow!.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps:true)
+    }
+    @objc func about() { NSApp.orderFrontStandardAboutPanel(options:[.applicationName:"CarmaChameleon",.applicationVersion:"\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] ?? "") (\(Bundle.main.infoDictionary?["CFBundleVersion"] ?? ""))",.credits:NSAttributedString(string:L("aboutDetail"))]) }
+    func add(_ menu:NSMenu,_ title:String,_ action:Selector,_ key:String) { let item = menu.addItem(withTitle:title,action:action,keyEquivalent:key); item.target = self }
+    func buildMenus() {
+        let bar = NSMenu(); NSApp.mainMenu = bar
+        let app = NSMenu(); let root = NSMenuItem(); root.submenu = app; bar.addItem(root)
+        add(app,L("about"),#selector(about),""); app.addItem(.separator()); add(app,L("settings"),#selector(showSettings),","); app.addItem(.separator())
+        #if DIRECT_UPDATES && !APP_STORE
+        AppUpdates.shared.addMenuItems(to:app)   // 「アップデートを確認…」「アップデートを自動確認」 + separator
+        #endif
+        let services = NSMenu(title:L("services")); app.addItem(withTitle:L("services"),action:nil,keyEquivalent:"").submenu = services; NSApp.servicesMenu = services; app.addItem(.separator())
+        app.addItem(withTitle:L("hideApp"),action:#selector(NSApplication.hide(_:)),keyEquivalent:"h"); app.addItem(withTitle:L("hideOthers"),action:#selector(NSApplication.hideOtherApplications(_:)),keyEquivalent:"h").keyEquivalentModifierMask = [.command,.option]; app.addItem(withTitle:L("showAll"),action:#selector(NSApplication.unhideAllApplications(_:)),keyEquivalent:""); app.addItem(.separator())
+        add(app,L("quit"),#selector(quit),"q")
+        let file = NSMenu(title:L("fileMenu")); let f = NSMenuItem(title:L("fileMenu"),action:nil,keyEquivalent:""); f.submenu = file; bar.addItem(f); add(file,L("openMainWindow"),#selector(show),"0"); file.addItem(.separator()); add(file,L("chooseFiles"),#selector(choose),"o"); file.addItem(.separator()); file.addItem(withTitle:L("close"),action:#selector(NSWindow.performClose(_:)),keyEquivalent:"w")
+        let edit = NSMenu(title:L("editMenu")); let e = NSMenuItem(title:L("editMenu"),action:nil,keyEquivalent:""); e.submenu = edit; bar.addItem(e)
+        for (key,action,shortcut) in [("undo","undo:","z"),("redo","redo:","z"),("cut","cut:","x"),("copy","copy:","c"),("paste","paste:","v"),("selectAll","selectAll:","a")] { edit.addItem(withTitle:L(key),action:Selector(action),keyEquivalent:shortcut) }
+        edit.item(at:1)?.keyEquivalentModifierMask = [.command,.shift]   // やり直す ⇧⌘Z
+        let win = NSMenu(title:L("windowMenu")); let wi = NSMenuItem(title:L("windowMenu"),action:nil,keyEquivalent:""); wi.submenu = win; bar.addItem(wi)
+        win.addItem(withTitle:L("minimize"),action:#selector(NSWindow.performMiniaturize(_:)),keyEquivalent:"")
+        win.addItem(withTitle:L("zoom"),action:#selector(NSWindow.performZoom(_:)),keyEquivalent:"")
+        win.addItem(.separator())
+        win.addItem(withTitle:L("bringAllToFront"),action:#selector(NSApplication.arrangeInFront(_:)),keyEquivalent:"")
+        NSApp.windowsMenu = win
+        let h = NSMenu(title:L("helpMenu")); let hi = NSMenuItem(title:L("helpMenu"),action:nil,keyEquivalent:""); hi.submenu = h; bar.addItem(hi); add(h,L("help"),#selector(showHelp),"?"); HelpLinks.addNoteItem(to:h); NSApp.helpMenu = h
+    }
+}
+let app = NSApplication.shared
+app.setActivationPolicy(.regular)
+MainActor.assumeIsolated {
+    let delegate = Delegate(); app.delegate = delegate
+    withExtendedLifetime(delegate) { app.run() }
+}

@@ -1,0 +1,175 @@
+## Basics
+1. Drop files on the left, or click Choose files… (Command-O).
+2. Choose an output format in the middle, and the input format and options on the right. Output formats are grouped into Business, Design, Image and Other ("File name only" sits at the top, outside the groups); formats the added files cannot become are hidden.
+3. Check where to save and click Convert (Command-Return). Each file is converted separately.
+4. Turn on Show in Finder after conversion to reveal the saved files when it finishes.
+- ⌘-click Convert to remove the converted files from the input list (files that failed stay). Clear input file list empties the list.
+
+## Saving and originals
+- **Same as source document** (default): saves next to each original.
+- **Choose a folder**: saves everything into one folder you choose.
+- Originals are never changed. Existing names get a number.
+- With Open files after conversion on (off by default), finished files open in their default apps.
+- Cancel keeps finished files and removes unfinished temporary files. There is no Undo; remove unwanted files in Finder.
+
+## Conversion options
+- Table of contents and section numbering are available only for formats that support them.
+- Text formats offer wrapping options.
+
+### PDF output
+- No PDF engine is bundled. In Settings › PDF engine (Typst), click Check latest version, then Install.
+- The official tar.xz is verified with SHA-256 and saved under ~/Library/Application Support/PandocDesk/PDFEngines/. No administrator rights are needed.
+- An installed XeLaTeX or LuaLaTeX also works; a button opens the official MacTeX download page.
+- Japanese text uses Hiragino Sans.
+
+### Keep structure (plain text)
+- Choose Plain text and turn on Keep structure to keep headings, lists, links and tables readable with marks and indents.
+- Headings get marks such as ■ ● ◇, list items start with ・, nested items are indented with full-width spaces, and checklists become □ / ■.
+- Links can be text only, Text <URL> or Text (URL), and can be collected below each paragraph or list item. Tables can be tab-separated or bordered.
+- Documents other than Markdown are first converted to Markdown, then the same rules apply.
+- The rules follow the note article (Japanese): https://note.com/swwwitch/n/n281cc79cdba2
+
+### HTML formatting
+- Choose **Standard** (default), **minify** or **beautify**. The choice is remembered.
+- minify trims extra spaces inside tags and line breaks between blocks; beautify puts block tags on their own lines with indentation.
+- Text, pre/code/textarea, CSS, JavaScript and comments are kept as is. CSS and JavaScript are not minified.
+
+### Keynote export
+- Choose Keynote as the output format to create a .key with each PDF page on its own slide, kept as vector artwork (Keynote required).
+- Other documents are first typeset to PDF with the selected PDF engine.
+- Choose the slide size, placement (fit or fill) and page box (CropBox, TrimBox and more).
+- Pages are placed as images, so their text cannot be edited in Keynote.
+- With Open files after conversion on, the presentation stays open in Keynote; otherwise it is closed after saving.
+- Cancel closes the unfinished presentation without saving.
+
+## Notes on input formats
+### Images (raster image, SVG)
+- Raster image writes PNG, JPEG, HEIC or AVIF (AVIF on supported macOS versions) from .ai, .psd, .indd, PDF and image files (PNG, JPEG, TIFF, HEIC, WebP, GIF, BMP): one image per artboard for .ai, per page for PDF and .indd, the flattened image of a .psd, and one image per image file.
+- The size is a resolution (ppi; used for .ai, .indd and PDF, while .psd files and images keep their pixels) or a width / height in pixels (resizes every input). Quality (JPEG, HEIC, AVIF), a transparent background (all but JPEG) and a range (e.g. 1,3-5; empty for all) can also be set. JPEG has a white background.
+- Photos are turned upright by their EXIF orientation. WebP can be read but not written.
+- SVG is exported only from .ai files, per artboard, with Illustrator's Export for Screens (Illustrator required). Styling, font, images, object IDs, decimal places, Minify and Responsive can be chosen.
+- File names combine the source file name, artboard number (PDF, InDesign: page number) and artboard name (InDesign: page name), with a separator (- _ space) and optional padding (01). An example is shown. With a single image you can keep just the source file name.
+- Turn on "Several images: put them in a folder named after the source" to collect two or more images in such a folder.
+- Image files become one PDF each, or one PDF in the order added with "Combine images into one PDF".
+- With the Simple method, images of an .ai are made from the PDF content stored in it (no artboard names).
+
+### Remove margins and shadow (YohakuTrimmer / KageTrimmer processing)
+- Options of Raster image. They apply to every source (.ai, .indd, PDF, .psd, image files), one image at a time at its final size.
+- Remove margins (off by default): cuts off rows and columns of one color on each side (as in YohakuTrimmer); the sides may differ in color. Color tolerance: None, Low (8) or High (32). Pixels are not resampled; an image of a single color is left as is.
+- Shadow (default Keep): No shadow, XS (10 px), S (27 px) or L (112 px). A macOS screenshot's shadow is removed and redrawn at the chosen size, and an image without one gets a shadow (as in KageTrimmer). No shadow only removes it; an image without a shadow is left as is.
+- Add a thin border (on by default) draws a faint line inside the outline, only when a shadow is added to an image without one.
+- With both, the margins are removed first, then the shadow. In JPEG, or with a transparent background off, the area outside the shadow is white.
+
+### Inputs and output formats
+- Formats the added files cannot become are dimmed in the format list and cannot be chosen; hover for the reason.
+- .psd, .indd and image files convert only to PDF and raster images, subtitles (.srt) only to CSV, Excel and UTF-16 text. Only .ai files can become SVG.
+
+### InDesign (.indd)
+- .indd files can be converted to PDF or raster images (InDesign required): PDF with the chosen PDF preset (InDesign's current export settings by default), images per page.
+- In Settings › InDesign, choose which InDesign to use and the PDF preset (list them with Load PDF presets from InDesign).
+- Files already open in InDesign are exported as they are and stay open (unsaved changes are included, with a notice). The PNG export settings are restored after converting. The first run asks for Automation permission to control InDesign.
+
+### Text → UTF-16
+- "UTF-16 text" re-encodes text files (.txt, .md, .csv, .tsv, .srt, .html and so on) as UTF-16.
+- Choose with or without a BOM, and the byte order (little or big endian). For Windows apps and Excel, "With BOM" and little endian are the safe choice.
+- With Input encoding set to Automatic, the BOM (UTF-8, UTF-16, UTF-32) decides, then UTF-8, Shift_JIS and EUC-JP are tried. Files read as anything but UTF-8 are noted in the results; if the text is garbled, choose the encoding and convert again. Shift_JIS includes Windows characters such as ① and ㈱.
+- Line endings: Keep, CRLF (Windows) or LF (macOS, Unix).
+- Join voiced sound marks (on by default) turns kana written with a separate mark (common on macOS) into one character. Nothing else is changed.
+- The extension stays as it is; in the same folder the result gets a number, as in "name (1).txt".
+
+### File name only (Mac ⇄ Windows)
+- "File name only" gives names that work on both macOS and Windows; the contents are unchanged. It accepts any kind of file, and folders (converted with everything inside).
+- Method: "Make a copy" (default; the original stays) or "Rename the original" (renamed where it is, and the input list shows the new name; the destination setting does not apply).
+- Symbols Windows rejects (\ / : * ? " < > |) become full-width characters (＼／：＊？”＜＞｜) or "_".
+- Spaces can be kept or changed to "_" or "-" (full-width spaces included).
+- A leading "." can be kept, changed to "_" or removed. Names starting with "." are hidden on macOS. .DS_Store and files starting with "._" (Finder data) are left as they are.
+- Unicode normalization (NFC, on by default) joins characters stored in decomposed form (common on macOS), such as kana with voiced marks, Hangul and accented letters. CJK compatibility ideographs such as 神 (U+FA19) are kept.
+- "Replace machine-dependent characters and emoji" (off by default) turns ① into (1), ㈱ into (株), Ⅰ into I, ㍉ into ミリ, 〜 into ～ and − into － (the Windows forms) and so on, and removes emoji, so old Shift_JIS applications do not show "?". Kanji such as 髙 and 﨑 are kept.
+- "Limit names to [100] characters" (off by default, 10–255) cuts names and keeps the extension. Windows may not handle paths over 260 characters including where they are placed, so a path inside a folder longer than 200 characters is noted in the results.
+- Control characters, leading spaces and trailing spaces or periods are removed; the names CON, PRN, AUX, NUL, COM1–9 and LPT1–9 get "_".
+- When no name needs to change (for a copy, when it would go into the same folder), nothing is done and the results say so. Existing names get a number, such as "name (1)".
+
+### Subtitles (.srt) → CSV, Excel
+- CSV or Excel turns subtitles into a table of #, time, handle and comment. The time is the start time (h:m:s).
+- Text in the form "handle: comment" is split at the first ": "; other text becomes the comment. Multi-line text is joined into one line.
+- The CSV separator is a comma (.csv) or a tab (.tsv). Comments containing commas or quotes are quoted.
+- Excel (.xlsx) output has the header row frozen; the number is numeric and the time is text.
+- "Split into sheets: [100] rows each" starts a new sheet every given number of rows. Each sheet repeats the header row (not counted), and sheets are named by their row range, such as "1-100" and "101-200" (the last one ends at the actual last row, such as "201-245").
+
+### Photoshop (.psd)
+- .psd files can be converted to PDF or a raster image.
+- **Simple (no Photoshop)**: uses the composite image stored in the .psd. Files saved without "Maximize Compatibility" may not convert correctly.
+- **Export with Photoshop (full)**: choose it in Settings › Photoshop or in the options shown when .psd files are added. Photoshop opens the file and saves a copy, so the original is not changed. Files already open in Photoshop are exported as they are and stay open (unsaved changes are included, with a notice). The first run asks for Automation permission to control Photoshop.
+
+### Illustrator (.ai)
+- .ai files can be converted to PDF (simple version, no Illustrator needed). With PDF as the output format, the PDF content stored in the .ai becomes the PDF as is. Illustrator's editing data is left out, so the PDF is smaller than the .ai.
+- With Keynote, each artboard becomes a slide; other formats extract the text.
+- This works for .ai files saved with "Create PDF Compatible File" on. Files saved with it off produce Adobe's notice page instead of the artwork, and a warning is shown.
+- **Full version (Export with Illustrator)**: choose it in Settings › Illustrator or in the options shown when .ai files are added. Illustrator exports each file with the chosen PDF preset (the same way as Export for Screens; the original file and its save location are not changed). .ai files saved without PDF compatibility work too.
+- Use Load PDF presets from Illustrator to list the presets, then pick one. You can also choose which Illustrator to use (newest by default).
+- Illustrator runs during conversion; font and link alerts are suppressed only while converting. Files already open in Illustrator are exported as they are and stay open (unsaved changes are included, with a notice). Missing linked images also give a notice. The first run asks for Automation permission to control Illustrator.
+
+### Tables (CSV, TSV, Excel)
+- CSV (.csv), TSV (.tsv) and Excel (.xlsx) files are read as tables and converted to tables in Word, HTML, Markdown, PDF and other formats.
+- Each sheet of an Excel workbook becomes a table in order. Formulas give their calculated values; formatting, merged cells, charts and images are not reproduced. The older .xls format is not supported.
+- With Keep structure for plain text, tables can be tab-separated or bordered.
+
+### PDF
+- Text is extracted as UTF-8 with pdftotext (poppler; brew install poppler with Homebrew); pages without text are read with Japanese/English OCR, all on this Mac. Without pdftotext, PDFKit extracts the text and the result says so.
+- For Plain text, pdftotext's output is written as is, without pandoc. Choose Reading order (columns in turn, default), Keep layout (-layout) or Content stream order (-raw). If Japanese line breaks land in the wrong places, try Keep layout. Pages are separated by a blank line.
+- Images, columns, table structure and layout are not reproduced. OCR can make mistakes.
+- If a page yields no text, conversion stops with an error and no partial result is saved.
+- Unlock password-protected PDFs first. Limit: 500 pages and 20 MB of extracted text.
+
+### IDML
+- Text is extracted without InDesign, in designmap story order; visual page order is not guaranteed.
+- Paragraphs, directly applied bold/italic and basic tables are supported. Paragraph styles named Heading 1–6 or 見出し1–6 become headings.
+- Images, page layout, typesetting and inherited styles are not reproduced. Input XML is limited to 20 MB in total.
+- IDML export lays out editable body text on A4 pages, without the original formatting, tables or images.
+
+## Managing pandoc
+- Settings shows the pandoc version, location and installation status in use.
+- Check latest version contacts the official GitHub. Install latest version verifies the official ZIP with SHA-256 and saves it under ~/Library/Application Support/PandocDesk/Engines/.
+- Checks and updates run only when you click a button. You can choose your own pandoc, and Use bundled version switches back at any time.
+
+## Settings
+- **Startup & Background**: Launch at login (off by default), hide main window at startup, hide from Dock and App Switcher (off by default; keeps the app out of the Dock and the ⌘Tab switcher, and you show it from the menu bar icon when shown or by opening the app again in Finder), keep running after closing, and the app launch keyboard shortcut.
+- The **Startup & Background** tab also shows the Keynote control permission.
+- **Output format** tab: choose which output formats appear in the main window and in what order. Unchecked formats are hidden. Formats are listed by category; drag or use ↑↓ to reorder them within a category. Restore defaults puts everything back (OpenDocument and LaTeX start hidden).
+- **Engines** tab: status, updates and custom paths for pandoc and the PDF engine (Typst).
+- While it keeps running, reopen the window from the Dock icon.
+- **Show in menu bar** (Startup & Background tab, or Menu Bar Settings… in the app menu): shows the menu bar icon (on by default). Its menu has Open Main Window, Settings…, Help (CarmaChameleon Help, Open the note Article) and Quit CarmaChameleon.
+- For a launch shortcut, create an Open App action for CarmaChameleon in the Shortcuts app and assign a key.
+
+## Sharing settings
+- In Settings > Sharing, share the format list and visibility, conversion options (text, HTML, Keynote, PDF, image, SVG, tables, UTF-16, filenames, export names), the Illustrator and Photoshop methods and what happens after conversion with your other Macs.
+- **Export & Import**: “Export…” writes CarmaChameleon-Settings.plist; on another Mac, choose that file with “Import…”; this Mac’s settings are replaced with the file’s. Cancel changes nothing.
+- **Settings Sync**: click “Set Sync Folder…” and choose a folder in iCloud Drive, Dropbox or similar. Choose the same folder on your other Macs to keep changes in step automatically. With a sync service, keep this folder downloaded and available offline.
+- Login launch, background, menu bar, output folder, PDF engine, the pandoc, Illustrator, Photoshop and InDesign locations, PDF presets and window positions stay per Mac.
+
+## Keyboard shortcuts
+- **Command-O**: choose files
+- **Command-Return**: convert
+- **Escape**: cancel the conversion
+- **Command-0**: open the main window (also after closing it)
+- **Command-W**: close the window
+- **Command-comma**: Settings
+- **Command-?**: Help
+- **Command-Q**: quit (not during a conversion — wait for it or cancel first)
+
+## Permissions and privacy
+- No Accessibility permission is needed.
+- Keynote export asks for Automation permission the first time. If you declined, turn on Keynote for CarmaChameleon in System Settings › Privacy & Security › Automation. Settings › Keynote control shows the status.
+- Documents are never sent to an external service. The app goes online only to check for or install pandoc and Typst updates.
+- Errors are shown on screen only; no diagnostic log is saved.
+
+## Troubleshooting
+- If a conversion fails, check the message, the input format and access to the destination folder.
+- If pandoc is missing, use the bundled version or install the latest one in Settings.
+- Help › Open the note Article opens the article with usage notes and support information.
+- Check for Updates… and Automatically Check for Updates in the app menu say updates are not configured yet (no update feed or signing key) and make no network access. Notarization is not set up either. Requires Apple Silicon and macOS 13 or later.
+
+## Removing
+1. Turn off Launch at login in Settings.
+2. Quit the app and move it to the Trash.
+3. Optionally delete Engines and PDFEngines in ~/Library/Application Support/PandocDesk/. The preferences identifier is jp.local.PandocDesk.
